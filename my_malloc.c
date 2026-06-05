@@ -2,6 +2,8 @@
 #include <windows.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <assert.h>
+#include <stdint.h>
 
 #define HEAP_SIZE (1024 * 1024) // 1 MB
 #define ALIGNMENT 16
@@ -13,6 +15,7 @@ typedef struct{
 
 typedef struct {
     size_t size;
+    size_t padding; // for alignment purposes
 } Footer;
 
 typedef struct FreeNode {
@@ -29,6 +32,7 @@ FreeNode* free_head = NULL;
 [Prologue] [Actual Chunks] [Epilogue]   ---> Heap Layout
 
 epilogue and prologue are always indicated as allocated with size 0, used for edge checks
+prologue has footer to make prev_chunk work, epilogue doesn't need footer since it's always at the end of the heap
 
 [Header] [Payload] [Footer]  ---> Chunk Layout
 
@@ -92,6 +96,34 @@ static Chunk* prev_chunk(Chunk* chunk){
     Footer* prev_footer = (Footer*)((char*)chunk - sizeof(Footer));
 
     return (Chunk*)((char*)chunk - sizeof(Chunk) - sizeof(Footer) - prev_footer->size);
+}
+
+static Chunk* coalesce(Chunk* chunk){
+    Chunk* next = next_chunk(chunk);
+
+    if(next->free){
+        remove_free_node((FreeNode*)(next + 1));
+
+        chunk->size += sizeof(Chunk) + sizeof(Footer) + next->size;
+    }
+
+    Footer* footer = get_footer(chunk);
+    footer->size = chunk->size;
+
+    Chunk* prev = prev_chunk(chunk);
+
+    if(prev->free){
+        remove_free_node((FreeNode*)(prev + 1));
+
+        prev->size += sizeof(Chunk) + sizeof(Footer) + chunk->size;
+
+        footer = get_footer(prev);
+        footer->size = prev->size;
+
+        chunk = prev;
+    }
+
+    return chunk;
 }
 
 int heap_init(){
@@ -192,15 +224,98 @@ void heap_free(void* ptr) {
     }
     chunk->free = true;
 
+    chunk=coalesce(chunk);
+
     FreeNode* node = (FreeNode*)(chunk + 1);
     insert_free_node(node);
 
 }
 
 
-int main(){
+// for testing
 
-    printf("%zu\n", sizeof(Chunk));
+static void dump_heap(void){
+    Chunk* chunk = heap_head;
 
-    return 0;
+    printf("==== HEAP ====\n");
+
+    while(chunk != epilogue){
+        printf(
+            "chunk=%p size=%zu free=%d footer=%zu\n",
+            (void*)chunk,
+            chunk->size,
+            chunk->free,
+            get_footer(chunk)->size
+        );
+
+        chunk = next_chunk(chunk);
+    }
+
+    printf("epilogue=%p\n", (void*)epilogue);
+    printf("==============\n");
+}
+
+static void dump_free_list(void){
+    printf("==== FREE LIST ====\n");
+
+    FreeNode* node = free_head;
+
+    while(node){
+        Chunk* chunk = ((Chunk*)node) - 1;
+
+        printf(
+            "chunk=%p size=%zu\n",
+            (void*)chunk,
+            chunk->size
+        );
+
+        node = node->next;
+    }
+
+    printf("===================\n");
+}
+
+static void validate_heap(void){
+    Chunk* chunk = heap_head;
+
+    while(chunk != epilogue){
+        Footer* footer = get_footer(chunk);
+
+        if(footer->size != chunk->size){
+            printf(
+                "BAD FOOTER at %p\n",
+                (void*)chunk
+            );
+            abort();
+        }
+
+        chunk = next_chunk(chunk);
+    }
+}
+
+static int free_list_count(void){
+    int count = 0;
+
+    FreeNode* node = free_head;
+
+    while(node){
+        count++;
+        node = node->next;
+    }
+
+    return count;
+}
+
+int main(void){
+    heap_init();
+
+    for(int i = 1; i <= 512; i++){
+        void* p = heap_alloc(i);
+
+        assert(p != NULL);
+
+        assert(((uintptr_t)p % 16) == 0);
+    }
+
+    printf("PASS\n");
 }
