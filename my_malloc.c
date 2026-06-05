@@ -5,6 +5,8 @@
 #include <assert.h>
 #include <stdint.h>
 
+#include "my_malloc.h"
+
 #define HEAP_SIZE (1024 * 1024) // 1 MB
 #define ALIGNMENT 16
 
@@ -304,18 +306,4 @@ static int free_list_count(void){
     }
 
     return count;
-}
-
-int main(void){
-    heap_init();
-
-    for(int i = 1; i <= 512; i++){
-        void* p = heap_alloc(i);
-
-        assert(p != NULL);
-
-        assert(((uintptr_t)p % 16) == 0);
-    }
-
-    printf("PASS\n");
 }
