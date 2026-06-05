@@ -21,31 +21,22 @@ typedef struct FreeNode {
 } FreeNode;
 
 Chunk* heap_head = NULL;
-
+Chunk* epilogue = NULL;
 FreeNode* free_head = NULL;
 
+/*
 
-int heap_init(){
-    heap_head = (Chunk*)VirtualAlloc(NULL, HEAP_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+[Prologue] [Actual Chunks] [Epilogue]   ---> Heap Layout
 
-    if (heap_head == NULL){
-        return -1;
-    }
+epilogue and prologue are always indicated as allocated with size 0, used for edge checks
 
-    heap_head->size = HEAP_SIZE - sizeof(Chunk) - sizeof(Footer);
-    heap_head->free = true;
-    Footer* footer = get_footer(heap_head);
-    footer->size = heap_head->size;
+[Header] [Payload] [Footer]  ---> Chunk Layout
 
+Header and Footer both contain size of chunk, so we can easily navigate between chunks 
 
-    free_head = (FreeNode*)(heap_head + 1);
-    free_head->next = NULL;
-    free_head->prev = NULL;
+*/
 
-    return 0;
-}
-
-static size_t align_size(size_t size){
+static size_t align_size(size_t size){ //for alignment purposes 
     return (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 }
 
@@ -99,7 +90,46 @@ static Chunk* next_chunk(Chunk* chunk){
 
 static Chunk* prev_chunk(Chunk* chunk){
     Footer* prev_footer = (Footer*)((char*)chunk - sizeof(Footer));
+
     return (Chunk*)((char*)chunk - sizeof(Chunk) - sizeof(Footer) - prev_footer->size);
+}
+
+int heap_init(){
+    heap_head = (Chunk*)VirtualAlloc(NULL, HEAP_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+    if (heap_head == NULL){
+        return -1;
+    }
+
+    Chunk* prologue = heap_head;
+    prologue->size = 0;
+    prologue->free = false;
+
+    Footer* prologue_footer = get_footer(prologue);
+    prologue_footer->size = 0;
+
+    Chunk* first = (Chunk*)((char*)prologue_footer + sizeof(Footer));
+
+    first->free = true;
+
+    first->size = HEAP_SIZE - 3 * sizeof(Chunk) - 2 * sizeof(Footer); // 3*chunk for epilogue+prologue+heap, 2*footer for prologue and heap
+
+    Footer* first_footer = get_footer(first);
+    first_footer->size = first->size;
+
+    epilogue = (Chunk*)((char*)first_footer + sizeof(Footer));
+
+    epilogue->size = 0;
+    epilogue->free = false;
+
+    heap_head = first;
+
+
+    free_head = (FreeNode*)(heap_head + 1);
+    free_head->next = NULL;
+    free_head->prev = NULL;
+
+    return 0;
 }
 
 void* heap_alloc(size_t size) {
@@ -114,7 +144,7 @@ void* heap_alloc(size_t size) {
             chunk->free = false;
 
             if (chunk->size >= size + sizeof(Chunk) + sizeof(Footer) + sizeof(FreeNode)){
-                Chunk* new_chunk = (Chunk*)((char*)(chunk + 1) + size);
+                Chunk* new_chunk = (Chunk*)((char*)(chunk + 1) + size + sizeof(Footer));
                 size_t old_size = chunk->size;
 
                 new_chunk->size = old_size - size - sizeof(Chunk) - sizeof(Footer);
