@@ -11,19 +11,19 @@
 
 #define ALIGNMENT 16
 
-#define MIN_PAYLOAD_SIZE ALIGNMENT
-#define MIN_FREE_SIZE (sizeof(Chunk) + sizeof(Footer) + sizeof(FreeNode) + MIN_PAYLOAD_SIZE)
-
 #define CHUNK_FREE 0x1
+#define PREV_CHUNK_FREE 0x2
 #define FLAGS_MASK 0xF
 #define SIZE_MASK (~(size_t)FLAGS_MASK)
 
 typedef struct Chunk{
     size_t size_flags; // size in upper bits, flags in lower bits
+    size_t padding;
 } Chunk;
 
 typedef struct Footer{
     size_t size;
+    size_t padding;
 } Footer;
 
 typedef struct FreeNode {
@@ -56,6 +56,10 @@ static bool chunk_is_free_(Chunk* chunk){
     return chunk->size_flags & CHUNK_FREE;
 }
 
+static bool prev_chunk_is_free_(Chunk* chunk){
+    return chunk->size_flags & PREV_CHUNK_FREE;
+}
+
 static void chunk_set_size_(Chunk* chunk, size_t size){
     assert((size & FLAGS_MASK) == 0);
 
@@ -70,9 +74,17 @@ static void chunk_set_used_(Chunk* chunk){
     chunk->size_flags &= ~CHUNK_FREE;
 }
 
+static void chunk_set_prev_free_(Chunk* chunk){
+    chunk->size_flags |= PREV_CHUNK_FREE;
+}
+
+static void chunk_set_prev_used_(Chunk* chunk){
+    chunk->size_flags &= ~PREV_CHUNK_FREE;
+}
+
 /*
 
-Bit-packed size_flags as size is aligned to 16 bytes, wo lowest 4 bits are empty
+Bit-packed size_flags as size is aligned to 16 bytes, so lowest 4 bits are empty
 Store free or allocated info in lower bits to save overhead
 
 flagmask extracts lower 4 bits with & 0xF, sizemask extracts upper bits upto 64th bit with & ~0xF
@@ -83,8 +95,21 @@ static size_t align_size_(size_t size){ //for alignment purposes
     return (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 }
 
+static size_t min_free_payload_size_(void){
+    return align_size_(sizeof(FreeNode));
+}
+
+static size_t min_alloc_size_(void){
+    return min_free_payload_size_() + sizeof(Footer);
+}
+
 static Footer* get_footer_(Chunk *chunk){
     return (Footer *)((char *)(chunk + 1) + chunk_size_(chunk));
+}
+
+static void write_free_footer_(Chunk *chunk){
+    Footer* footer = get_footer_(chunk);
+    footer->size = chunk_size_(chunk);
 }
 
 static void insert_free_node_(FreeNode* node){
@@ -128,7 +153,8 @@ static void replace_free_node_(FreeNode* old, FreeNode* new){
 }
 
 static Chunk* next_chunk_(Chunk* chunk){
-    return (Chunk*)((char*)get_footer_(chunk) + sizeof(Footer));
+    size_t footer_size = chunk_is_free_(chunk) ? sizeof(Footer) : 0;
+    return (Chunk*)((char*)(chunk + 1) + chunk_size_(chunk) + footer_size);
 }
 
 static Chunk* prev_chunk_(Chunk* chunk){
@@ -149,23 +175,23 @@ static Chunk* coalesce_(Chunk* chunk){
         chunk_set_size_(chunk, chunk_size);
     }
 
-    Footer* footer = get_footer_(chunk);
-    footer->size = chunk_size;
+    write_free_footer_(chunk);
 
-    Chunk* prev = prev_chunk_(chunk);
-    size_t prev_size = chunk_size_(prev);
-
-    if(chunk_is_free_(prev)){
+    if(prev_chunk_is_free_(chunk)){
+        Chunk* prev = prev_chunk_(chunk);
+        size_t prev_size = chunk_size_(prev);
         remove_free_node_((FreeNode*)(prev + 1));
 
         prev_size += sizeof(Chunk) + sizeof(Footer) + chunk_size;
         chunk_set_size_(prev, prev_size);
 
-        footer = get_footer_(prev);
-        footer->size = prev_size;
+        write_free_footer_(prev);
 
         chunk = prev;
     }
+
+    next = next_chunk_(chunk);
+    chunk_set_prev_free_(next);
 
     return chunk;
 }
@@ -175,38 +201,39 @@ int heap_init(){
         return 0;
     }
 
-    void* raw = (Chunk*)VirtualAlloc(NULL, HEAP_SIZE + ALIGNMENT, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); // allocate extra for alignment so that we can align the first chunk to 16 bytes
+    void* raw = (Chunk*)VirtualAlloc(NULL, HEAP_SIZE + ALIGNMENT, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); // allocate extra for alignment so that we can align the first chunk
 
     if (raw == NULL){
         return -1;
     }
 
-    uintptr_t aligned = ((uintptr_t)raw + (ALIGNMENT - 1)) & ~(uintptr_t)(ALIGNMENT - 1); // align the first chunk to 16 bytes, this is what the extra mem was for
+    uintptr_t aligned = ((uintptr_t)raw + (ALIGNMENT - 1)) & ~(uintptr_t)(ALIGNMENT - 1); // align the first chunk, this is what the extra mem was for
 
-    Chunk* prologue = (Chunk*)(aligned + sizeof(Chunk));
+    Chunk* prologue = (Chunk*)aligned;
 
+    prologue->size_flags = 0;
     chunk_set_size_(prologue, 0);
     chunk_set_used_(prologue);
+    chunk_set_prev_used_(prologue);
 
-    Footer* prologue_footer = get_footer_(prologue);
-    prologue_footer->size = 0;
-
-    Chunk* first = (Chunk*)((char*)prologue_footer + sizeof(Footer));
+    Chunk* first = prologue + 1;
 
     first->size_flags = 0;
     chunk_set_free_(first);
+    chunk_set_prev_used_(first);
 
-    size_t raw_size = HEAP_SIZE - 3*sizeof(Chunk) - 2*sizeof(Footer); // 3*chunk for epilogue+prologue+heap, 2*footer for prologue and heap
-    size_t first_size = raw_size & ~(size_t)FLAGS_MASK;  // align to 16
+    size_t raw_size = HEAP_SIZE - 3*sizeof(Chunk) - sizeof(Footer); // prologue, first header, first footer, epilogue
+    size_t first_size = raw_size & SIZE_MASK;
     chunk_set_size_(first, first_size); 
 
-    Footer* first_footer = get_footer_(first);
-    first_footer->size = chunk_size_(first);
+    write_free_footer_(first);
 
-    epilogue = (Chunk*)((char*)first_footer + sizeof(Footer));
+    epilogue = next_chunk_(first);
 
+    epilogue->size_flags = 0;
     chunk_set_size_(epilogue, 0);
     chunk_set_used_(epilogue);
+    chunk_set_prev_free_(epilogue);
 
     first_chunk = first;
 
@@ -227,29 +254,32 @@ void* heap_alloc(size_t size) {
     }
     
     size = align_size_(size);
+    if (size < min_alloc_size_()){
+        size = min_alloc_size_();
+    }
 
     FreeNode* current = free_head;
 
     while(current != NULL){
         Chunk* chunk = ((Chunk*)current) - 1;
 
-        if (chunk_is_free_(chunk) && chunk_size_(chunk) >= size){
+        if (chunk_is_free_(chunk) && chunk_size_(chunk) + sizeof(Footer) >= size){
 
-            if (chunk_size_(chunk) >= size + MIN_FREE_SIZE){
+            if (chunk_size_(chunk) >= size + sizeof(Chunk) + min_free_payload_size_()){
 
-                Chunk* new_chunk = (Chunk*)((char*)(chunk + 1) + size + sizeof(Footer));
+                Chunk* new_chunk = (Chunk*)((char*)(chunk + 1) + size);
 
                 new_chunk->size_flags = 0;
                 size_t old_size = chunk_size_(chunk);
 
-                size_t new_chunk_size = old_size - size - sizeof(Chunk) - sizeof(Footer);
+                size_t new_chunk_size = old_size - size - sizeof(Chunk);
 
                 chunk_set_size_(new_chunk, new_chunk_size);
                 
                 chunk_set_free_(new_chunk);
+                chunk_set_prev_used_(new_chunk);
 
-                Footer* new_footer = get_footer_(new_chunk);
-                new_footer->size = chunk_size_(new_chunk);
+                write_free_footer_(new_chunk);
 
                 FreeNode* new_node = (FreeNode*)(new_chunk + 1);
                 
@@ -257,15 +287,18 @@ void* heap_alloc(size_t size) {
                 chunk_set_size_(chunk, size);
                 chunk_set_used_(chunk);
 
-                Footer* footer = get_footer_(chunk);
-                footer->size = chunk_size_(chunk);
+                Chunk* after_new = next_chunk_(new_chunk);
+                chunk_set_prev_free_(after_new);
 
                 return (void*)(chunk + 1);
             }
 
             else{
+                Chunk* next = next_chunk_(chunk);
                 remove_free_node_(current);
+                chunk_set_size_(chunk, chunk_size_(chunk) + sizeof(Footer));
                 chunk_set_used_(chunk);
+                chunk_set_prev_used_(next);
                 
                 return (void*)(chunk + 1);
             }
@@ -289,7 +322,12 @@ void heap_free(void* ptr) {
         printf("Double free detected\n");
         return;
     }
+    chunk_set_size_(chunk, chunk_size_(chunk) - sizeof(Footer));
     chunk_set_free_(chunk);
+    write_free_footer_(chunk);
+
+    Chunk* next = next_chunk_(chunk);
+    chunk_set_prev_free_(next);
 
     chunk=coalesce_(chunk);
 
