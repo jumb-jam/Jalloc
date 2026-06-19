@@ -16,15 +16,19 @@
 #define FLAGS_MASK 0xF
 #define SIZE_MASK (~(size_t)FLAGS_MASK)
 
-typedef struct Chunk{
-    size_t size_flags; // size in upper bits, flags in lower bits
-    size_t padding;
-} Chunk;
+#define NUM_CLASSES 16
+#define MIN_CLASS_SIZE 32
 
-typedef struct Footer{
+typedef struct Segment{
+    void* base;
     size_t size;
-    size_t padding;
-} Footer;
+    struct Segment* next;
+} Segment;
+
+typedef struct Chunk{
+    size_t prev_size;  // payload size of the previous chunk
+    size_t size_flags; // size in upper bits, flags in lower bits
+} Chunk;
 
 typedef struct FreeNode {
     struct FreeNode *next;
@@ -33,18 +37,20 @@ typedef struct FreeNode {
 
 Chunk* first_chunk = NULL;
 Chunk* epilogue = NULL;
-FreeNode* free_head = NULL;
+Segment* segments = NULL;
+FreeNode* free_heads[NUM_CLASSES] = {0};
+static SRWLOCK heap_lock = SRWLOCK_INIT;
 
 /*
 
-[Prologue] [Actual Chunks] [Epilogue]   ---> Heap Layout
+[Segment Metadata] [Prologue] [Actual Chunks] [Epilogue]   ---> Heap Layout
 
 epilogue and prologue are always indicated as allocated with size 0, used for edge checks
-prologue has footer to make prev_chunk work, epilogue doesn't need footer since it's always at the end of the heap
+each segment has its own prologue and epilogue, so coalescing does not cross segment boundaries
 
-[Header] [Payload] [Footer]  ---> Chunk Layout
+[Header] [Payload]  ---> Chunk Layout
 
-Header and Footer both contain size of chunk, so we can easily navigate between chunks 
+Header contains this chunk's size and the previous chunk's size, so we can navigate both ways
 
 */
 
@@ -64,6 +70,12 @@ static void chunk_set_size_(Chunk* chunk, size_t size){
     assert((size & FLAGS_MASK) == 0);
 
     chunk->size_flags = (chunk->size_flags & FLAGS_MASK) | size;
+}
+
+static void chunk_set_prev_size_(Chunk* chunk, size_t size){
+    assert((size & FLAGS_MASK) == 0);
+
+    chunk->prev_size = size;
 }
 
 static void chunk_set_free_(Chunk* chunk){
@@ -100,35 +112,44 @@ static size_t min_free_payload_size_(void){
 }
 
 static size_t min_alloc_size_(void){
-    return min_free_payload_size_() + sizeof(Footer);
+    return min_free_payload_size_();
 }
 
-static Footer* get_footer_(Chunk *chunk){
-    return (Footer *)((char *)(chunk + 1) + chunk_size_(chunk));
-}
+static int size_class_(size_t size){
+    int class = 0;
+    size_t class_size = MIN_CLASS_SIZE;
 
-static void write_free_footer_(Chunk *chunk){
-    Footer* footer = get_footer_(chunk);
-    footer->size = chunk_size_(chunk);
+    while (class < NUM_CLASSES - 1 && size > class_size){
+        class++;
+        class_size <<= 1;
+    }
+
+    return class;
 }
 
 static void insert_free_node_(FreeNode* node){
-    node->next = free_head;
+    Chunk* chunk = ((Chunk*)node) - 1;
+    int class = size_class_(chunk_size_(chunk));
+
+    node->next = free_heads[class];
     node->prev = NULL;
 
-    if (free_head){
-        free_head->prev = node;
+    if (free_heads[class]){
+        free_heads[class]->prev = node;
     }
 
-    free_head = node;
+    free_heads[class] = node;
 }
 
 static void remove_free_node_(FreeNode* node){
+    Chunk* chunk = ((Chunk*)node) - 1;
+    int class = size_class_(chunk_size_(chunk));
+
     if (node->prev){
         node->prev->next = node->next;
     }
     else{
-        free_head = node->next;
+        free_heads[class] = node->next;
     }
 
     if (node->next){
@@ -136,31 +157,70 @@ static void remove_free_node_(FreeNode* node){
     }
 }
 
-static void replace_free_node_(FreeNode* old, FreeNode* new){
-    new->prev = old->prev;
-    new->next = old->next;
-
-    if (new->prev){
-        new->prev->next = new;
-    }
-    else{
-        free_head = new;
-    }
-
-    if (new->next){
-        new->next->prev = new;
-    }
-}
-
 static Chunk* next_chunk_(Chunk* chunk){
-    size_t footer_size = chunk_is_free_(chunk) ? sizeof(Footer) : 0;
-    return (Chunk*)((char*)(chunk + 1) + chunk_size_(chunk) + footer_size);
+    return (Chunk*)((char*)(chunk + 1) + chunk_size_(chunk));
 }
 
 static Chunk* prev_chunk_(Chunk* chunk){
-    Footer* prev_footer = (Footer*)((char*)chunk - sizeof(Footer));
+    return (Chunk*)((char*)chunk - sizeof(Chunk) - chunk->prev_size);
+}
 
-    return (Chunk*)((char*)chunk - sizeof(Chunk) - sizeof(Footer) - prev_footer->size);
+static Chunk* create_segment_(size_t min_payload_size){
+    size_t alloc_size = HEAP_SIZE;
+    size_t required_size = sizeof(Segment) + ALIGNMENT + 3 * sizeof(Chunk) + min_payload_size;
+
+    if (required_size > alloc_size){
+        alloc_size = align_size_(required_size);
+    }
+
+    void* raw = VirtualAlloc(NULL, alloc_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+    if (raw == NULL){
+        return NULL;
+    }
+
+    Segment* segment = (Segment*)raw;
+    segment->base = raw;
+    segment->size = alloc_size;
+    segment->next = segments;
+    segments = segment;
+
+    uintptr_t aligned = ((uintptr_t)raw + sizeof(Segment) + (ALIGNMENT - 1)) & ~(uintptr_t)(ALIGNMENT - 1);
+    Chunk* prologue = (Chunk*)aligned;
+
+    prologue->prev_size = 0;
+    prologue->size_flags = 0;
+    chunk_set_size_(prologue, 0);
+    chunk_set_used_(prologue);
+    chunk_set_prev_used_(prologue);
+
+    Chunk* first = prologue + 1;
+
+    chunk_set_prev_size_(first, 0);
+    first->size_flags = 0;
+    chunk_set_free_(first);
+    chunk_set_prev_used_(first);
+
+    size_t raw_size = (size_t)((char*)raw + alloc_size - (char*)(first + 1) - sizeof(Chunk));
+    size_t first_size = raw_size & SIZE_MASK;
+    chunk_set_size_(first, first_size);
+
+    Chunk* segment_epilogue = next_chunk_(first);
+
+    chunk_set_prev_size_(segment_epilogue, first_size);
+    segment_epilogue->size_flags = 0;
+    chunk_set_size_(segment_epilogue, 0);
+    chunk_set_used_(segment_epilogue);
+    chunk_set_prev_free_(segment_epilogue);
+
+    if (first_chunk == NULL){
+        first_chunk = first;
+    }
+    epilogue = segment_epilogue;
+
+    insert_free_node_((FreeNode*)(first + 1));
+
+    return first;
 }
 
 static Chunk* coalesce_(Chunk* chunk){
@@ -171,144 +231,133 @@ static Chunk* coalesce_(Chunk* chunk){
     if(chunk_is_free_(next)){
         remove_free_node_((FreeNode*)(next + 1));
 
-        chunk_size += sizeof(Chunk) + sizeof(Footer) + next_size;
+        chunk_size += sizeof(Chunk) + next_size;
         chunk_set_size_(chunk, chunk_size);
     }
-
-    write_free_footer_(chunk);
 
     if(prev_chunk_is_free_(chunk)){
         Chunk* prev = prev_chunk_(chunk);
         size_t prev_size = chunk_size_(prev);
         remove_free_node_((FreeNode*)(prev + 1));
 
-        prev_size += sizeof(Chunk) + sizeof(Footer) + chunk_size;
+        prev_size += sizeof(Chunk) + chunk_size;
         chunk_set_size_(prev, prev_size);
-
-        write_free_footer_(prev);
 
         chunk = prev;
     }
 
     next = next_chunk_(chunk);
+    chunk_set_prev_size_(next, chunk_size_(chunk));
     chunk_set_prev_free_(next);
 
     return chunk;
 }
 
-int heap_init(){
+static int heap_init_unlocked_(void){
     if (first_chunk){
         return 0;
     }
 
-    void* raw = (Chunk*)VirtualAlloc(NULL, HEAP_SIZE + ALIGNMENT, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); // allocate extra for alignment so that we can align the first chunk
-
-    if (raw == NULL){
-        return -1;
+    for (int i = 0; i < NUM_CLASSES; i++){
+        free_heads[i] = NULL;
     }
 
-    uintptr_t aligned = ((uintptr_t)raw + (ALIGNMENT - 1)) & ~(uintptr_t)(ALIGNMENT - 1); // align the first chunk, this is what the extra mem was for
-
-    Chunk* prologue = (Chunk*)aligned;
-
-    prologue->size_flags = 0;
-    chunk_set_size_(prologue, 0);
-    chunk_set_used_(prologue);
-    chunk_set_prev_used_(prologue);
-
-    Chunk* first = prologue + 1;
-
-    first->size_flags = 0;
-    chunk_set_free_(first);
-    chunk_set_prev_used_(first);
-
-    size_t raw_size = HEAP_SIZE - 3*sizeof(Chunk) - sizeof(Footer); // prologue, first header, first footer, epilogue
-    size_t first_size = raw_size & SIZE_MASK;
-    chunk_set_size_(first, first_size); 
-
-    write_free_footer_(first);
-
-    epilogue = next_chunk_(first);
-
-    epilogue->size_flags = 0;
-    chunk_set_size_(epilogue, 0);
-    chunk_set_used_(epilogue);
-    chunk_set_prev_free_(epilogue);
-
-    first_chunk = first;
-
-
-    free_head = (FreeNode*)(first_chunk + 1);
-    free_head->next = NULL;
-    free_head->prev = NULL;
+    if (create_segment_(min_free_payload_size_()) == NULL){
+        return -1;
+    }
 
     return 0;
 }
 
-void* heap_alloc(size_t size) {
+int heap_init(){
+    AcquireSRWLockExclusive(&heap_lock);
+    int result = heap_init_unlocked_();
+    ReleaseSRWLockExclusive(&heap_lock);
 
-    if(!first_chunk){
-        if (heap_init() != 0){
-            return NULL;
-        }
-    }
-    
+    return result;
+}
+
+static void* heap_alloc_unlocked_(size_t size){
     size = align_size_(size);
     if (size < min_alloc_size_()){
         size = min_alloc_size_();
     }
 
-    FreeNode* current = free_head;
+    for (;;){
+        int start_class = size_class_(size);
 
-    while(current != NULL){
-        Chunk* chunk = ((Chunk*)current) - 1;
+        for (int i = start_class; i < NUM_CLASSES; i++){
+            FreeNode* current = free_heads[i];
 
-        if (chunk_is_free_(chunk) && chunk_size_(chunk) + sizeof(Footer) >= size){
+            while(current != NULL){
+                FreeNode* next_node = current->next;
+                Chunk* chunk = ((Chunk*)current) - 1;
 
-            if (chunk_size_(chunk) >= size + sizeof(Chunk) + min_free_payload_size_()){
+                if (chunk_is_free_(chunk) && chunk_size_(chunk) >= size){
 
-                Chunk* new_chunk = (Chunk*)((char*)(chunk + 1) + size);
+                    if (chunk_size_(chunk) >= size + sizeof(Chunk) + min_free_payload_size_()){
 
-                new_chunk->size_flags = 0;
-                size_t old_size = chunk_size_(chunk);
+                        Chunk* new_chunk = (Chunk*)((char*)(chunk + 1) + size);
 
-                size_t new_chunk_size = old_size - size - sizeof(Chunk);
+                        chunk_set_prev_size_(new_chunk, size);
+                        new_chunk->size_flags = 0;
+                        size_t old_size = chunk_size_(chunk);
 
-                chunk_set_size_(new_chunk, new_chunk_size);
+                        size_t new_chunk_size = old_size - size - sizeof(Chunk);
+
+                        remove_free_node_(current);
+
+                        chunk_set_size_(new_chunk, new_chunk_size);
+                        
+                        chunk_set_free_(new_chunk);
+                        chunk_set_prev_used_(new_chunk);
+
+                        FreeNode* new_node = (FreeNode*)(new_chunk + 1);
+                        insert_free_node_(new_node);
+
+                        chunk_set_size_(chunk, size);
+                        chunk_set_used_(chunk);
+
+                        Chunk* after_new = next_chunk_(new_chunk);
+                        chunk_set_prev_size_(after_new, new_chunk_size);
+                        chunk_set_prev_free_(after_new);
+
+                        return (void*)(chunk + 1);
+                    }
+
+                    else{
+                        Chunk* next = next_chunk_(chunk);
+                        remove_free_node_(current);
+                        chunk_set_used_(chunk);
+                        chunk_set_prev_size_(next, chunk_size_(chunk));
+                        chunk_set_prev_used_(next);
+                        
+                        return (void*)(chunk + 1);
+                    }
+                }
                 
-                chunk_set_free_(new_chunk);
-                chunk_set_prev_used_(new_chunk);
-
-                write_free_footer_(new_chunk);
-
-                FreeNode* new_node = (FreeNode*)(new_chunk + 1);
-                
-                replace_free_node_(current, new_node);
-                chunk_set_size_(chunk, size);
-                chunk_set_used_(chunk);
-
-                Chunk* after_new = next_chunk_(new_chunk);
-                chunk_set_prev_free_(after_new);
-
-                return (void*)(chunk + 1);
-            }
-
-            else{
-                Chunk* next = next_chunk_(chunk);
-                remove_free_node_(current);
-                chunk_set_size_(chunk, chunk_size_(chunk) + sizeof(Footer));
-                chunk_set_used_(chunk);
-                chunk_set_prev_used_(next);
-                
-                return (void*)(chunk + 1);
+                current = next_node;
             }
         }
-        
-        current = current->next;
+
+        if (create_segment_(size) == NULL){
+            return NULL;
+        }
+    }
+}
+
+void* heap_alloc(size_t size) {
+    AcquireSRWLockExclusive(&heap_lock);
+
+    if (heap_init_unlocked_() != 0){
+        ReleaseSRWLockExclusive(&heap_lock);
+        return NULL;
     }
 
-    return NULL;
+    void* ptr = heap_alloc_unlocked_(size);
+    ReleaseSRWLockExclusive(&heap_lock);
 
+    return ptr;
 }
 
 void heap_free(void* ptr) {
@@ -316,17 +365,19 @@ void heap_free(void* ptr) {
         return;
     }
 
+    AcquireSRWLockExclusive(&heap_lock);
+
     Chunk* chunk = ((Chunk*)ptr) - 1;
 
     if(chunk_is_free_(chunk)){
         printf("Double free detected\n");
+        ReleaseSRWLockExclusive(&heap_lock);
         return;
     }
-    chunk_set_size_(chunk, chunk_size_(chunk) - sizeof(Footer));
     chunk_set_free_(chunk);
-    write_free_footer_(chunk);
 
     Chunk* next = next_chunk_(chunk);
+    chunk_set_prev_size_(next, chunk_size_(chunk));
     chunk_set_prev_free_(next);
 
     chunk=coalesce_(chunk);
@@ -334,6 +385,7 @@ void heap_free(void* ptr) {
     FreeNode* node = (FreeNode*)(chunk + 1);
     insert_free_node_(node);
 
+    ReleaseSRWLockExclusive(&heap_lock);
 }
 
 
